@@ -10,11 +10,11 @@ description = "Core training module for the Open Language Model (OLMo)"
 authors = [
     { name = "Allen Institute for Artificial Intelligence", email = "olmo@allenai.org" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { file = "LICENSE" }
 dependencies = [
     "numpy",
-    "torch>=2.6.0",
+    "torch==2.9.1",
     "cached-path>=1.7.2",
     "requests",
     "packaging",
@@ -22,7 +22,8 @@ dependencies = [
     "omegaconf",
     "safetensors",
     "importlib_resources",
-    "bettermap"
+    "bettermap",
+    "xlstm>=2.0.0",
 ]
 
 [project.urls]
@@ -165,4 +166,14 @@ filterwarnings = [
     'ignore::FutureWarning:torch\.distributed\.checkpoint\.default_planner',
     'ignore::UserWarning:torch\.distributed\.checkpoint\.state_dict_saver',
     'ignore::UserWarning:torch\.distributed\.checkpoint\.state_dict_loader',
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130" }
 ]
