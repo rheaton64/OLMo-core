@@ -16,6 +16,7 @@ from olmo_core.distributed.parallel import (
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.float8 import Float8Config
 from olmo_core.nn.transformer import MoETransformer, Transformer
+from olmo_core.nn.xlstm_large.model import xLSTMLarge
 
 from .config import (
     TransformerActivationCheckpointingConfig,
@@ -47,7 +48,7 @@ def parallelize_model(
     ac_config: Optional[TransformerActivationCheckpointingConfig] = None,
     pp_enabled: bool = False,
 ) -> M:
-    model_parts: List[Transformer] = [model] if isinstance(model, Transformer) else model
+    model_parts: List[Transformer] = [model] if isinstance(model, (Transformer, xLSTMLarge)) else model
 
     pp_mesh: Optional[DeviceMesh] = None
     if pp_enabled:

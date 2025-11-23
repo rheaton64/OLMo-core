@@ -573,7 +573,7 @@ class TransformerPipelineTrainModule(TrainModule):
                     else:
                         z_batch_loss += get_local_tensor(z_loss.detach())
 
-                return loss.unsqueeze(0)
+                return loss.unsqueeze(0).contiguous().clone()
             else:
                 assert isinstance(output, torch.Tensor)
                 return output

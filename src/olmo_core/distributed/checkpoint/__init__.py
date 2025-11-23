@@ -99,7 +99,7 @@ def save_state_dict(
     if not _skip_prepare:
         dir = _prepare_env_for_save(dir, process_group=process_group, save_overwrite=save_overwrite)
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True
     )
     dist_cp.state_dict_saver.save(
         state_dict,
@@ -134,7 +134,7 @@ def async_save_state_dict(
     if not _skip_prepare:
         dir = _prepare_env_for_save(dir, process_group=process_group, save_overwrite=save_overwrite)
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True
     )
     return dist_cp.state_dict_saver.async_save(
         state_dict,
@@ -230,7 +230,7 @@ def save_model_and_optim_state(
         flatten_optimizer_state=flatten_optimizer_state,
     )
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True
     )
     dist_cp.state_dict_saver.save(
         state_dict,
@@ -271,7 +271,7 @@ def async_save_model_and_optim_state(
         flatten_optimizer_state=flatten_optimizer_state,
     )
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True
     )
     return dist_cp.state_dict_saver.async_save(
         state_dict,

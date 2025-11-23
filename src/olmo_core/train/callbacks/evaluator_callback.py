@@ -81,7 +81,7 @@ class EvaluatorCallback(Callback):
     def post_attach(self):
         if not isinstance(self.trainer.train_module, TransformerTrainModule):
             raise OLMoConfigurationError(
-                f"'{self.__class__.__name__}' only suports the '{TransformerTrainModule.__name__}' train module"
+                f"'{self.__class__.__name__}' only suports the '{TransformerTrainModule.__name__}' train module, not '{type(self.trainer.train_module).__name__}'"
             )
 
     def pre_train(self):

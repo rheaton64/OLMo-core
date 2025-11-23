@@ -166,14 +166,19 @@ class OptimConfig(Config, Generic[Opt], metaclass=ABCMeta):
         :param strict: If ``True`` an error is raised if a pattern in ``group_overrides`` doesn't
             match any parameter.
         """
-        kwargs = self.as_dict()
+        kwargs = self.as_dict(exclude_private_fields=True)
         kwargs.pop("group_overrides")
         kwargs.pop("compile")
         kwargs.pop("fixed_fields")
 
-        optim: torch.optim.Optimizer = self.optimizer()(
-            self.build_groups(model, strict=strict), **kwargs
-        )
+        if hasattr(self, "_is_adamw_instance"):
+            optim: torch.optim.Optimizer = self.optimizer()(
+                model, **kwargs
+            )
+        else:
+            optim = self.optimizer()(
+                self.build_groups(model, strict=strict), **kwargs
+            )
 
         # Set 'lr' and 'initial_lr' in each group if needed.
         fixed_fields_per_group: List[Dict[str, Any]] = [{} for _ in optim.param_groups]

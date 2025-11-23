@@ -70,6 +70,11 @@ class WandBCallback(Callback):
     The config to load to W&B.
     """
 
+    run_id: Optional[str] = None
+    """
+    The run ID to use.
+    """
+
     cancel_tags: Optional[List[str]] = field(
         default_factory=lambda: ["cancel", "canceled", "cancelled"]
     )
@@ -103,6 +108,12 @@ class WandBCallback(Callback):
     def run_path(self):
         return self._run_path
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {"run_id": self.run_id}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        self.run_id = state_dict.get("run_id")
+
     def pre_train(self):
         if self.enabled and get_rank() == 0:
             if WANDB_API_KEY_ENV_VAR not in os.environ:
@@ -120,8 +131,11 @@ class WandBCallback(Callback):
                 tags=self.tags,
                 notes=self.notes,
                 config=self.config,
+                id=self.run_id,
+                resume="allow" if self.run_id is not None else "never",
             )
             self._run_path = self.run.path  # type: ignore
+            self.run_id = self.run.id  # type: ignore
 
     def log_metrics(self, step: int, metrics: Dict[str, float]):
         if self.enabled and get_rank() == 0:

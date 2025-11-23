@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
+import torch.nn as nn
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
 from torch.distributed import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
@@ -25,6 +26,7 @@ from olmo_core.nn.transformer import (
     TransformerActivationCheckpointingMode,
     TransformerDataParallelWrappingStrategy,
 )
+from olmo_core.nn.xlstm_large.model import xLSTMLarge
 from olmo_core.optim import OptimConfig
 from olmo_core.optim.scheduler import Scheduler
 
@@ -87,6 +89,13 @@ class TransformerPipelineParallelConfig(PipelineParallelConfig):
     def split_model(
         self, model: Transformer, *, pp_mesh: DeviceMesh, device: torch.device
     ) -> Tuple[List[PipelineStage], List[Transformer]]:
+        if isinstance(model, xLSTMLarge):
+            return self._split_xlstm_model(model, pp_mesh=pp_mesh, device=device)
+        return self._split_transformer_model(model, pp_mesh=pp_mesh, device=device)
+
+    def _split_transformer_model(
+        self, model: Transformer, *, pp_mesh: DeviceMesh, device: torch.device
+    ) -> Tuple[List[PipelineStage], List[Transformer]]:
         split_points = self.get_split_points(model.n_layers)
         pp_rank = pp_mesh.get_local_rank()
 
@@ -124,10 +133,70 @@ class TransformerPipelineParallelConfig(PipelineParallelConfig):
             return stage, model_chunk
 
         num_stages = len(split_points) + 1
-        stage_idx = pp_rank
+        stages: List[PipelineStage] = []
+        models: List[Transformer] = []
+        for stage_idx in self.stage_ids_this_rank(pp_rank, num_stages):
+            start_layer = split_points[stage_idx - 1] if stage_idx > 0 else None
+            stop_layer = split_points[stage_idx] if stage_idx < num_stages - 1 else None
+            stage, model_chunk = build_stage(
+                stage_idx,
+                start_layer,
+                stop_layer,
+                is_first=stage_idx == 0,
+                is_last=stage_idx == num_stages - 1,
+            )
+            log.info(
+                f"PP rank {pp_rank} is building stage {stage_idx} with start layer "
+                f"{start_layer}, stop layer {stop_layer}: {model_chunk}"
+            )
+            stages.append(stage)
+            models.append(model_chunk)
 
-        stages = []
-        models = []
+        return stages, models
+
+    def _split_xlstm_model(
+        self, model: xLSTMLarge, *, pp_mesh: DeviceMesh, device: torch.device
+    ) -> Tuple[List[PipelineStage], List[Transformer]]:
+        num_layers = len(model.backbone.blocks)
+        split_points = self.get_split_points(num_layers)
+        pp_rank = pp_mesh.get_local_rank()
+
+        def build_stage(
+            stage_idx: int,
+            start_layer: Optional[int],
+            stop_layer: Optional[int],
+            is_first: bool = False,
+            is_last: bool = False,
+        ) -> Tuple[PipelineStage, Transformer]:
+            model_chunk = copy.deepcopy(model)
+            if not is_first:
+                model_chunk.embedding = None  # type: ignore
+
+            kept_blocks = nn.ModuleList()
+            for block_idx, block in enumerate(model_chunk.backbone.blocks):
+                if start_layer is not None and block_idx < start_layer:
+                    continue
+                if stop_layer is not None and block_idx >= stop_layer:
+                    continue
+                kept_blocks.append(block)
+            model_chunk.backbone.blocks = kept_blocks
+
+            if not is_last:
+                model_chunk.lm_head = None  # type: ignore
+                model_chunk.backbone.out_norm = nn.Identity()  # type: ignore
+
+            stage = PipelineStage(
+                model_chunk,
+                stage_idx,
+                num_stages,
+                device,
+                group=pp_mesh.get_group("pp"),
+            )
+            return stage, model_chunk
+
+        num_stages = len(split_points) + 1
+        stages: List[PipelineStage] = []
+        models: List[Transformer] = []
         for stage_idx in self.stage_ids_this_rank(pp_rank, num_stages):
             start_layer = split_points[stage_idx - 1] if stage_idx > 0 else None
             stop_layer = split_points[stage_idx] if stage_idx < num_stages - 1 else None
