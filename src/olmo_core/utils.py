@@ -453,7 +453,7 @@ def set_env_variables():
         :func:`prepare_cli_environment()`
     """
     set_env_var("OMP_NUM_THREADS", "8")
-    set_env_var("TOKENIZERS_PARALLELISM", "false")
+    set_env_var("TOKENIZERS_PARALLELISM", "true")
 
 
 def prepare_cli_environment(log_filter_type: Optional[LogFilterType] = None):

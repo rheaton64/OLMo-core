@@ -296,7 +296,7 @@ def build_config(opts, overrides: List[str]) -> ExperimentConfig:
             WandBCallback(
                 project="SYNTH-xLSTM-large",
                 cancel_check_interval=10,
-                enabled=True,
+                enabled=False,
                 name="fiery-silence-12"
             ),
         )
@@ -398,9 +398,11 @@ def parser_args():
 
 
 def main():
+    print("Starting training...")
     opts, overrides = parser_args()
     config = build_config(opts, overrides)
     torch._dynamo.config.capture_scalar_outputs = True
+    torch._dynamo.config.suppress_errors = True
 
     if opts.dry_run:
         rich.print(config)

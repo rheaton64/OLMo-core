@@ -180,6 +180,7 @@ class TransformerPipelineParallelConfig(PipelineParallelConfig):
                     continue
                 kept_blocks.append(block)
             model_chunk.backbone.blocks = kept_blocks
+            model_chunk._first_block_idx = start_layer or 0
 
             if not is_last:
                 model_chunk.lm_head = None  # type: ignore

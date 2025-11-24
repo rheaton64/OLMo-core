@@ -352,17 +352,26 @@ class TransformerPipelineTrainModule(TrainModule):
             merge_state_dicts(state_dict, full_state_dict)
 
         for model, optim in zip(self.model_parts, self.optimizers):
+            offset = getattr(model, "_first_block_idx", 0)
+            model_state_dict = state_dict["model"]
+            if offset > 0:
+                model_state_dict = self._unmap_keys(model_state_dict, offset)
+
             dist_cp_sd.set_model_state_dict(
                 model,
-                state_dict["model"],
+                model_state_dict,
                 options=self.state_dict_load_opts,
             )
             gc_cuda()
             if load_optim:
+                optim_state_dict = state_dict["optim"]
+                if offset > 0:
+                    optim_state_dict = self._unmap_keys(optim_state_dict, offset)
+
                 dist_cp_sd.set_optimizer_state_dict(
                     model,
                     optim,
-                    state_dict["optim"],
+                    optim_state_dict,
                     options=self.state_dict_load_opts,
                 )
                 gc_cuda()
@@ -609,27 +618,68 @@ class TransformerPipelineTrainModule(TrainModule):
     def _get_state_dict(
         self, sd_options: dist_cp_sd.StateDictOptions, optim: bool = True
     ) -> Dict[str, Any]:
-        state_dict: Dict[str, Any] = {
-            "model": {
-                k: v
-                for sd in map(
-                    partial(dist_cp_sd.get_model_state_dict, options=sd_options), self.model_parts
+        model_sd: Dict[str, Any] = {}
+        optim_sd: Dict[str, Any] = {}
+
+        for i, model_part in enumerate(self.model_parts):
+            part_model_sd = dist_cp_sd.get_model_state_dict(model_part, options=sd_options)
+            
+            offset = getattr(model_part, "_first_block_idx", 0)
+            if offset > 0:
+                part_model_sd = self._remap_keys(part_model_sd, offset)
+            
+            model_sd.update(part_model_sd)
+
+            if optim:
+                part_optim_sd = dist_cp_sd.get_optimizer_state_dict(
+                    model_part, self.optimizers[i], options=sd_options
                 )
-                for k, v in sd.items()
-            }
-        }
+                if offset > 0:
+                    part_optim_sd = self._remap_keys(part_optim_sd, offset)
+                optim_sd.update(part_optim_sd)
+
+        state_dict = {"model": model_sd}
         if optim:
-            state_dict["optim"] = {
-                k: v
-                for sd in map(
-                    partial(dist_cp_sd.get_optimizer_state_dict, options=sd_options),
-                    self.model_parts,
-                    self.optimizers,
-                )
-                for k, v in sd.items()
-            }
+            state_dict["optim"] = optim_sd
 
         return state_dict
+
+    def _remap_keys(self, state_dict: Dict[str, Any], offset: int) -> Dict[str, Any]:
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if "backbone.blocks." in key:
+                parts = key.split(".")
+                try:
+                    # Find "blocks"
+                    idx = parts.index("blocks")
+                    # The next part should be the index
+                    block_idx = int(parts[idx + 1])
+                    parts[idx + 1] = str(block_idx + offset)
+                    new_key = ".".join(parts)
+                    new_state_dict[new_key] = value
+                except (ValueError, IndexError):
+                    new_state_dict[key] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+
+    def _unmap_keys(self, state_dict: Dict[str, Any], offset: int) -> Dict[str, Any]:
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if "backbone.blocks." in key:
+                parts = key.split(".")
+                try:
+                    idx = parts.index("blocks")
+                    block_idx = int(parts[idx + 1])
+                    new_block_idx = block_idx - offset
+                    parts[idx + 1] = str(new_block_idx)
+                    new_key = ".".join(parts)
+                    new_state_dict[new_key] = value
+                except (ValueError, IndexError):
+                    new_state_dict[key] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
 
     def _clip_grad_norm(
         self, max_grad_norm: float, norm_type: float = 2.0, foreach: Optional[bool] = None

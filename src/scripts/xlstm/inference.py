@@ -1,489 +1,485 @@
+#!/usr/bin/env python3
+"""
+Run autoregressive inference for xLSTM-large checkpoints trained with ``scripts/xlstm/train.py``.
+
+This script loads a checkpoint directory (unsharded), restores the model weights, then repeatedly
+prefills the model with chunks from a ``data.bin`` file before streaming decoded tokens.
+
+Example::
+
+    # Single-GPU inference
+    python src/scripts/xlstm/inference.py \
+        /raid/ckpts/SYNTH_xlstm_large/unshard/model.pt \
+        --orig-ckpt-dir /raid/ckpts/SYNTH_xlstm_large/step108000 \
+        --data-bin /raid/datasets/SYNTH/test_rank_00_0000.bin \
+        --prefill-len 4096 \
+        --max-new-tokens 64 \
+        --num-chunks 1 \
+        --keep-state \
+        --stream \
+        --verbose
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import logging
-import os
-from typing import Optional, Dict, Any, cast
+from pathlib import Path
+import traceback
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
-from torch.distributed.device_mesh import init_device_mesh
 
-try:
-    from transformers import AutoTokenizer, PreTrainedTokenizerBase
-except ImportError:
-    AutoTokenizer = None
-    PreTrainedTokenizerBase = None
-
+from olmo_core.nn.xlstm_large.generate import get_sampling_fn
 from olmo_core.nn.xlstm_large.model import xLSTMLarge, xLSTMLargeConfig
-from olmo_core.train.train_module.transformer.config import TransformerPipelineParallelConfig
+from olmo_core.utils import prepare_cli_environment
 
-
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
 log = logging.getLogger(__name__)
 
 
-def load_config(checkpoint_path: str) -> Dict[str, Any]:
-    config_path = os.path.join(checkpoint_path, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-    
-    with open(config_path, "r") as f:
-        config_dict = json.load(f)
-    
-    return config_dict
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="xLSTM inference with streaming output from pre-recorded tokens.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "checkpoint_path",
+        type=str,
+        help="Path to the unsharded model checkpoint file (.pt or .safetensors).",
+    )
+    parser.add_argument(
+        "--data-bin",
+        type=str,
+        required=True,
+        help="Binary file of uint tokens (matching the tokenizer used during training).",
+    )
+    parser.add_argument(
+        "--data-dtype",
+        type=str,
+        default="uint16",
+        help="Numpy dtype of the binary data file.",
+    )
+    parser.add_argument(
+        "--prefill-len",
+        type=int,
+        default=2048,
+        help="Number of tokens to use from the data file for each prefill window.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=128,
+        help="Number of new tokens to sample after each prefill window.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Stride between prefill windows. Defaults to --prefill-len.",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Starting token offset within the binary file.",
+    )
+    parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=1,
+        help="How many prefill windows to process. Set to 0 to iterate until EOF.",
+    )
+    parser.add_argument(
+        "--sampling",
+        type=str,
+        default="greedy",
+        choices=["greedy"],
+        help="Sampling strategy to use for decoding.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device to run on (default picks CUDA if available).",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Emit each generated token immediately instead of buffering a chunk.",
+    )
+    parser.add_argument(
+        "--keep-state",
+        action="store_true",
+        help="Carry inference state across chunks (treat chunks as a single long sequence).",
+    )
+    parser.add_argument(
+        "--bos-token-id",
+        type=int,
+        default=None,
+        help="Optional BOS token to prepend when a chunk would otherwise start empty.",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Run the model in float16 (may cause NaN issues). Default is float32 for stability.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+    parser.add_argument(
+        "--orig-ckpt-dir",
+        type=str,
+        help="Optional path to the original training checkpoint directory (used for config files).",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Optional HuggingFace tokenizer identifier/path. Defaults to the training config tokenizer identifier if present.",
+    )
+    parser.add_argument(
+        "--debug-logits",
+        action="store_true",
+        help="Print top-k logits for the final prefill position and first decode step.",
+    )
+    parser.add_argument(
+        "--debug-top-k",
+        type=int,
+        default=5,
+        help="Top-k tokens to display when --debug-logits is set.",
+    )
+    return parser.parse_args()
 
 
-def get_sampler(
-    type: str = "greedy",
-    temperature: float = 1.0,
-    top_k: int = 50,
-    top_p: float = 1.0,
-) -> Any: # Returning Any because Callable type is complex here
-    def greedy_sampling(logits: torch.Tensor) -> torch.Tensor:
-        return torch.argmax(logits, dim=-1)
-
-    def top_k_sampling(logits: torch.Tensor) -> torch.Tensor:
-        # logits: [B, V]
-        if temperature == 0.0:
-            return greedy_sampling(logits)
-            
-        # Apply temperature
-        logits = logits / temperature
-        
-        # Top-k filtering
-        if top_k > 0:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-            
-        # Top-p (nucleus) filtering
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = -float('Inf')
-            
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-    if type == "greedy":
-        return greedy_sampling
-    elif type == "top_k":
-        return top_k_sampling
-    else:
-        raise ValueError(f"Unknown sampling type: {type}")
-
-
-def generate_stream(
-    model: torch.nn.Module,
-    prefill_tokens: torch.Tensor,
-    max_length: int,
-    sampling_fn: Any,
-    device: str = "cuda",
-) -> Any: # Generator
+def resolve_config_path(checkpoint_path: str, config_override: Optional[str]) -> Path:
     """
-    Generator that yields tokens as they are generated.
-    This uses model.forward() directly.
+    Resolve the path to config.json.
     """
-    if prefill_tokens.ndim == 1:
-        prefill_tokens = prefill_tokens[:, None]
+    ckpt = Path(checkpoint_path).expanduser().resolve()
     
-    # Prefill
-    # We process the prefill tokens and yield the last token's output (first generated token)
-    last_token = prefill_tokens
-    state = None
-    
-    # For the first step, we process the whole prefill
-    with torch.no_grad():
-        logits, state = model(last_token, state=state)
-        # logits: [B, S, V]
-        next_token_logits = logits[:, -1, :] # [B, V]
-        next_token = sampling_fn(next_token_logits) # [B]
-        
-        yield next_token
-        
-    last_token = next_token.unsqueeze(1) # [B, 1]
-    
-    # Generation loop
-    for i in range(max_length - 1): # -1 because we yielded one token after prefill
-        with torch.no_grad():
-            logits, state = model(last_token, state=state)
-            next_token_logits = logits[:, -1, :]
-            next_token = sampling_fn(next_token_logits)
-            
-            yield next_token
-            
-            last_token = next_token.unsqueeze(1)
-
-
-def load_model_pp(
-    checkpoint_path: str,
-    device: str,
-    pp_degree: int,
-    rank: int,
-    world_size: int,
-) -> torch.nn.Module:
-    log.info(f"Loading config from {checkpoint_path}...")
-    config_dict = load_config(checkpoint_path)
-    
-    if "model" in config_dict:
-        model_config_dict = config_dict["model"]
+    if config_override:
+        config_dir = Path(config_override).expanduser().resolve()
     else:
-        model_config_dict = config_dict
-
-    model_config = xLSTMLargeConfig.from_dict(model_config_dict)
-    model_config.mode = "inference"
-    model_config.return_last_states = True
-    
-    log.info("Building model on meta device...")
-    with torch.device("meta"):
-        model = model_config.build(init_device="meta")
-    
-    # Create DeviceMesh
-    # Assuming simple 1D PP mesh for now
-    if world_size != pp_degree:
-        raise ValueError(f"World size ({world_size}) must match PP degree ({pp_degree}) for this script")
-    
-    # Initialize mesh with 'cuda' device type as we move parts to it
-    pp_mesh = init_device_mesh("cuda", (pp_degree,), mesh_dim_names=("pp",))
-    
-    # Create PP Config and split
-    pp_config = TransformerPipelineParallelConfig(degree=pp_degree)
-    
-    log.info("Splitting model for Pipeline Parallelism...")
-    # We need to ensure the model is in a state that split_model accepts.
-    # split_model usually expects model on 'meta' or 'cpu'.
-    # It deepcopies the model.
-    
-    # NOTE: split_model expects 'model.n_layers' which xLSTMLarge might not expose directly as property
-    # but _split_xlstm_model uses config.num_blocks usually.
-    # We inject n_layers just in case if _split_transformer_model path is taken (unlikely for xLSTMLarge)
-    # or if the property is accessed.
-    if not hasattr(model, "n_layers"):
-        # Cast to Any to avoid linter error about assigning new attribute
-        cast(Any, model).n_layers = model.config.num_blocks
-
-    # Cast model to Any to satisfy split_model type hint if needed
-    stages, models = pp_config.split_model(cast(Any, model), pp_mesh=pp_mesh, device=torch.device(device))
-    
-    local_model = models[0] # The chunk for this rank
-    
-    # Materialize the local model chunk (it might be meta if split_model preserved meta)
-    # split_model implementation usually moves to device, but let's ensure.
-    local_model.to_empty(device=device)
-    # We need to init weights? 
-    # Actually we load from checkpoint, so random init is fine before override.
-    # But to be safe against NaNs if some parts aren't loaded:
-    local_model.init_weights() 
-    local_model.to(device)
-
-    log.info(f"Loading weights into local chunk (Rank {rank})...")
-    
-    model_and_optim_path = os.path.join(checkpoint_path, "model_and_optim")
-    if not os.path.exists(model_and_optim_path):
-        model_and_optim_path = checkpoint_path
-        
-    # Wrap in dict for DCP
-    # DCP handles loading keys that exist in the state_dict.
-    # Since split_model removed blocks, local_model.state_dict() only has the subset keys.
-    # DCP should match them with the checkpoint and load.
-    state_dict_to_load = {"model": local_model.state_dict()}
-    
-    try:
-        dcp.load(
-            state_dict=state_dict_to_load,
-            checkpoint_id=model_and_optim_path,
-        )
-        local_model.load_state_dict(state_dict_to_load["model"])
-    except Exception as e:
-        log.error(f"Failed to load checkpoint using DCP: {e}")
-        raise
-
-    local_model.eval()
-    return local_model
-
-
-def load_model(checkpoint_path: str, device: str = "cuda") -> xLSTMLarge:
-    log.info(f"Loading config from {checkpoint_path}...")
-    config_dict = load_config(checkpoint_path)
-    
-    # Extract model config. 
-    # The train.py saves the ExperimentConfig, so 'model' is a key in it.
-    if "model" in config_dict:
-        model_config_dict = config_dict["model"]
-    else:
-        # Fallback if the config is just the model config
-        model_config_dict = config_dict
-
-    model_config = xLSTMLargeConfig.from_dict(model_config_dict)
-    
-    log.info("Building model...")
-    model = model_config.build(init_device=device)
-    model.eval()
-    
-    # Load checkpoint
-    # The checkpoint structure from train.py (via TrainModule) is usually 
-    # {"model": model_state_dict, "optim": ...}
-    # stored in the 'model_and_optim' subdirectory.
-    
-    model_and_optim_path = os.path.join(checkpoint_path, "model_and_optim")
-    if not os.path.exists(model_and_optim_path):
-        # Try the root if model_and_optim doesn't exist (backward compatibility or different saver)
-        model_and_optim_path = checkpoint_path
-        
-    log.info(f"Loading weights from {model_and_optim_path}...")
-    
-    # We need to construct the state dict structure that DCP expects to load INTO.
-    # Since the checkpoint saves {"model": ...}, we need to wrap our model state dict.
-    state_dict_to_load = {"model": model.state_dict()}
-    
-    try:
-        dcp.load(
-            state_dict=state_dict_to_load,
-            checkpoint_id=model_and_optim_path,
-        )
-        # We don't need to do anything else, dcp loads in-place into the tensors in state_dict_to_load["model"],
-        # which are the parameters of 'model'.
-        # However, we should verify if we need to load_state_dict back into model if state_dict() returned copies.
-        # In recent PyTorch/DCP, it's best to check.
-        # But usually passing model.state_dict() works because it gets the parameters.
-        
-        # Explicitly load back just in case dcp replaced tensors in the dict but didn't update module parameters 
-        # (though dcp usually updates in place if possible).
-        model.load_state_dict(state_dict_to_load["model"])
-        
-    except Exception as e:
-        log.error(f"Failed to load checkpoint using DCP: {e}")
-        # Fallback for non-DCP checkpoints or simple torch.save
-        if os.path.exists(os.path.join(checkpoint_path, "model.pt")):
-             model.load_state_dict(torch.load(os.path.join(checkpoint_path, "model.pt"), map_location=device))
+        # Try to find config in the same directory or parent
+        if ckpt.is_file():
+            config_dir = ckpt.parent
         else:
-             raise
+            config_dir = ckpt
 
-    log.info("Model loaded successfully.")
-    return model
+    if config_dir.is_file():
+        raise FileNotFoundError(f"Invalid config directory '{config_dir}'")
+
+    config_path = config_dir / "config.json"
+    if not config_path.is_file():
+        # One fallback: if we are in unshard dir, maybe check parent
+        if config_dir.name == "unshard" and (config_dir.parent / "config.json").is_file():
+             return config_dir.parent / "config.json"
+        
+        raise FileNotFoundError(f"Missing config.json in '{config_dir}' or parent")
+
+    return config_path
 
 
-def load_tokenizer(checkpoint_path: str) -> Optional[Any]:
-    """
-    Attempt to load a tokenizer based on the checkpoint configuration.
-    """
-    if AutoTokenizer is None:
-        log.warning("transformers library not found, cannot load tokenizer.")
+def load_config(config_path: Path) -> Dict[str, Any]:
+    with config_path.open("r") as f:
+        return json.load(f)
+
+
+def _load_tokenizer(args: argparse.Namespace, config_dict: Dict[str, Any]):
+    identifier = args.tokenizer
+    if identifier is None:
+        identifier = (
+            config_dict.get("train_module", {})
+            .get("tokenizer", {})
+            .get("identifier")
+        )
+    if identifier is None:
+        log.warning("Tokenizer identifier not provided; tokens will be printed as ids.")
+        return None
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        log.warning(
+            "transformers not installed; cannot load tokenizer '%s'. Install transformers to decode tokens.",
+            identifier,
+        )
         return None
 
     try:
-        config_dict = load_config(checkpoint_path)
-        # Try to find tokenizer identifier in standard ExperimentConfig structure
-        identifier = config_dict.get("dataset", {}).get("tokenizer", {}).get("identifier")
-        
-        if identifier:
-            log.info(f"Attempting to load tokenizer from {identifier}...")
-            return AutoTokenizer.from_pretrained(identifier)
-    except Exception as e:
-        log.warning(f"Failed to load tokenizer: {e}")
-    
-    return None
+        tok = AutoTokenizer.from_pretrained(identifier, trust_remote_code=True)
+        log.info("Loaded tokenizer '%s' for decoding output.", identifier)
+        return tok
+    except Exception as exc:
+        log.warning("Failed to load tokenizer '%s': %s. Falling back to token ids.", identifier, exc)
+        return None
 
 
-def run_pp_inference(
-    model_chunk: torch.nn.Module,
+def _load_local_state_file(
+    model: xLSTMLarge,
+    state_path: Path,
+    *,
+    strict: bool,
+) -> None:
+    log.info("Loading local state dict from '%s'", state_path)
+    if state_path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file as safetensors_load_file
+        except ImportError as exc:
+            raise ImportError(
+                "Please install safetensors to load checkpoints saved in safetensors format."
+            ) from exc
+        state_obj: Any = safetensors_load_file(str(state_path))
+    else:
+        state_obj = torch.load(state_path, map_location="cpu")
+
+    if isinstance(state_obj, dict) and "model" in state_obj:
+        state_to_load: Any = state_obj["model"]
+    else:
+        state_to_load = state_obj
+
+    if not isinstance(state_to_load, Mapping):
+        raise TypeError(
+            f"Checkpoint at '{state_path}' did not contain a mapping-compatible state dict."
+        )
+
+    if any("_orig_mod" in key for key in state_to_load.keys()):
+        state_to_load = {
+            _sanitize_compiled_key(key): value for key, value in state_to_load.items()
+        }
+
+    missing, unexpected = model.load_state_dict(state_to_load, strict=strict)
+    if missing:
+        log.warning("Missing keys during load: %s", missing)
+    if unexpected:
+        log.warning("Unexpected keys during load: %s", unexpected)
+
+
+def _sanitize_compiled_key(key: str) -> str:
+    new_key = key
+    replacements = [
+        ("._orig_mod.", "."),
+        ("_orig_mod.", ""),
+        ("._orig_mod", ""),
+        ("_orig_mod", ""),
+    ]
+    for old, new in replacements:
+        new_key = new_key.replace(old, new)
+    while ".." in new_key:
+        new_key = new_key.replace("..", ".")
+    if new_key.startswith("."):
+        new_key = new_key[1:]
+    if new_key.endswith("."):
+        new_key = new_key[:-1]
+    return new_key
+
+
+def _decode_tokens(tokenizer: Any, token_ids: list[int]) -> str:
+    if tokenizer is None:
+        return " ".join(str(t) for t in token_ids)
+    try:
+        return tokenizer.decode(token_ids, skip_special_tokens=False)
+    except Exception as exc:
+        log.warning("Tokenizer decode failed: %s; falling back to ids", exc)
+        return " ".join(str(t) for t in token_ids)
+
+
+def _print_topk(tag: str, logits: torch.Tensor, k: int, tokenizer: Any = None) -> None:
+    if logits.ndim == 3:
+        logits = logits[:, -1, :]
+    scores, idx = torch.topk(logits, k, dim=-1)
+    tokens = idx[0].tolist()
+    scores_list = scores[0].tolist()
+    decoded = _decode_tokens(tokenizer, tokens)
+    log.info(
+        "[%s] topk tokens=%s decoded=%s scores=%s",
+        tag,
+        tokens,
+        decoded,
+        [float(s) for s in scores_list],
+    )
+
+
+def load_data(path: str, dtype: str) -> np.memmap:
+    np_dtype = np.dtype(dtype)
+    return np.memmap(path, dtype=np_dtype, mode="r")
+
+
+def iter_prefill_chunks(
+    data: np.memmap,
+    chunk_len: int,
+    stride: int,
+    offset: int,
+    limit: Optional[int],
+) -> Iterator[Tuple[int, int, np.ndarray]]:
+    idx = offset
+    chunk_id = 0
+    while idx + chunk_len <= len(data):
+        yield chunk_id, idx, np.asarray(data[idx : idx + chunk_len])
+        chunk_id += 1
+        if limit and chunk_id >= limit:
+            break
+        idx += stride
+
+
+def stream_generate(
+    model: xLSTMLarge,
     prefill_tokens: torch.Tensor,
-    generate_length: int,
-    rank: int,
-    world_size: int,
-    device: str,
-    sampling_type: str,
-    temperature: float = 1.0,
-    top_k: int = 50,
-    tokenizer: Optional[Any] = None,
-):
-    # We will not implement PP streaming inference in this script version as per request
-    # to simplify and fix the "bugs" by using model forward directly.
-    # However, for PP, we can't just call model(input) on one rank for the whole model.
-    # The user asked to "just make a new generate_stream func that uses the model forward".
-    # If they are running single GPU, we use generate_stream.
-    # If they are running PP, we need to orchestrate it.
-    # Assuming the user might be reverting to single GPU or wants a cleaner single GPU implementation primarily
-    # and maybe simpler PP if possible.
-    # But let's stick to the "generate_stream" request.
-    
-    # IF PP is active, we can't easily use a simple generate_stream that looks like the single GPU one
-    # because of the distributed communication.
-    # BUT if the user thinks my manual PP loop was buggy, maybe they want me to rewrite the PP loop 
-    # to look more like generate_stream or just fix the single GPU case?
-    # "Instead of implementing your own forward... just make a new generate_stream func that uses the model forward"
-    # This likely refers to the single GPU case where I might have been doing something weird (I wasn't really, 
-    # I was calling model() in a loop which is correct).
-    
-    # However, for PP, I implemented a manual send/recv loop. 
-    # If `model_chunk` is a PipelineStage or similar that handles communication, we could just call forward.
-    # But `model_chunk` here is just a shard of the model (xLSTMLarge).
-    # The `PipelineStage` wrapper in `olmo_core` handles communication.
-    # Ah! I passed `models[0]` (the raw model shard) to `run_pp_inference`.
-    # I should have passed the `stages[0]` (PipelineStage) if I wanted to use its forward?
-    # `PipelineStage` in `olmo_core` is designed for training (minibatches, backward pass).
-    # Using it for inference might be tricky.
-    
-    # Given the complexity and the user's specific request "use model forward", 
-    # I will assume they prioritize the single-device inference or a cleaner generator pattern.
-    # For PP, I will leave the manual orchestration but check if I can simplify it or if I should just focus on single device.
-    # Let's update the single device path to use `generate_stream` and print as we go.
-    pass
+    max_new_tokens: int,
+    sampling_fn: Callable[[torch.Tensor], torch.Tensor],
+    state: Optional[Dict] = None,
+    callback: Optional[Callable[[int, int], None]] = None,
+    debug: bool = False,
+    debug_top_k: int = 5,
+    tokenizer: Any = None,
+) -> Tuple[torch.Tensor, Optional[Dict]]:
+    logits, state = model(prefill_tokens, state)
+    if debug:
+        _print_topk("prefill_last", logits[:, -1:], debug_top_k, tokenizer=tokenizer)
+
+    last_token = prefill_tokens[:, -1:]
+    generated: list[torch.Tensor] = []
+
+    for step in range(max_new_tokens):
+        logits, state = model(last_token, state)
+        if debug:
+            _print_topk("decode_step0", logits, debug_top_k, tokenizer=tokenizer)
+        next_token = sampling_fn(logits[:, -1:])
+        generated.append(next_token)
+        if callback is not None:
+            callback(step, int(next_token[0, 0].item()))
+        last_token = next_token
+
+    return torch.cat(generated, dim=1), state
+
 
 def run_single_device_inference(
-    model: torch.nn.Module,
-    prefill_tokens: torch.Tensor,
-    generate_length: int,
-    sampling_type: str,
-    temperature: float,
-    top_k: int,
-    tokenizer: Optional[Any],
-    device: str,
+    *,
+    args: argparse.Namespace,
+    model: xLSTMLarge,
+    sampling_fn: Callable[[torch.Tensor], torch.Tensor],
+    data: np.memmap,
+    device: torch.device,
+    tokenizer: Any,
 ):
-    log.info(f"Running inference on {device}...")
-    log.info(f"Prompt IDs: {prefill_tokens.tolist()}")
-    
-    if tokenizer:
-        print(f"Prompt Text: {tokenizer.decode(prefill_tokens[0])}")
-
-    sampling_fn = get_sampler(type=sampling_type, temperature=temperature, top_k=top_k)
-    
-    print("\nGenerated Output: ", end="", flush=True)
-    
-    generator = generate_stream(
-        model=model,
-        prefill_tokens=prefill_tokens,
-        max_length=generate_length,
-        sampling_fn=sampling_fn,
-        device=device
+    stride = args.stride or args.prefill_len
+    state: Optional[Dict] = None
+    chunk_iter = iter_prefill_chunks(
+        data,
+        chunk_len=args.prefill_len,
+        stride=stride,
+        offset=args.offset,
+        limit=args.num_chunks if args.num_chunks != 0 else None,
     )
-    
-    for next_token in generator:
-        token_id = next_token.item()
-        if tokenizer:
-            print(tokenizer.decode([token_id]), end="", flush=True)
-        else:
-            print(f"{token_id} ", end="", flush=True)
-            
-    print("\n")
-    log.info("Generation complete.")
 
+    for chunk_id, start_idx, chunk in chunk_iter:
+        chunk_tensor = torch.from_numpy(chunk.astype(np.int64, copy=False))
+        if chunk_tensor.numel() == 0 and args.bos_token_id is not None:
+            chunk_tensor = torch.tensor([args.bos_token_id], dtype=torch.long)
+        elif chunk_tensor.numel() == 0:
+            log.warning("Skipping empty chunk at offset %d", start_idx)
+            continue
 
-def load_data(data_file: str, start_index: int, length: int) -> torch.Tensor:
-    log.info(f"Loading data from {data_file}...")
-    data = np.memmap(data_file, dtype=np.uint16, mode="r")
-        
-    if start_index + length > len(data):
-        raise ValueError(f"Requested chunk [{start_index}:{start_index+length}] is out of bounds for data length {len(data)}")
-        
-    chunk = data[start_index : start_index + length]
-    return torch.tensor(chunk, dtype=torch.long)
+        prefill = chunk_tensor.unsqueeze(0).to(device=device, dtype=torch.long)
+        prefill_text = _decode_tokens(tokenizer, chunk_tensor.tolist())
+        marker = "<|GEN|>"
+
+        print(f"[chunk {chunk_id}] prefill: {prefill_text} {marker}", end="", flush=True)
+
+        generated, state = stream_generate(
+            model,
+            prefill_tokens=prefill,
+            max_new_tokens=args.max_new_tokens,
+            sampling_fn=sampling_fn,
+            state=state,
+            callback=lambda step, token: print(f"{_decode_tokens(tokenizer, [token])}", end="", flush=True),
+            debug=args.debug_logits,
+            debug_top_k=args.debug_top_k,
+            tokenizer=tokenizer,
+        )
+
+        if not args.keep_state:
+            state = None
 
 
 def main():
-    """
-    uv run src/scripts/xlstm/inference.py \
-        --checkpoint-dir /raid/ckpts/SYNTH_xlstm_large/step108000 \
-        --data-file /raid/datasets/SYNTH/train_rank_00_0000.bin
-    """
+    try:
+        args = parse_args()
+        prepare_cli_environment()
+        log.setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
-    parser = argparse.ArgumentParser(description="Run inference with xLSTM model.")
-    parser.add_argument("--checkpoint-dir", type=str, required=True, help="Path to the checkpoint directory (e.g. /path/to/step1000)")
-    parser.add_argument("--data-file", type=str, required=True, help="Path to the data file (.npy)")
-    parser.add_argument("--start-index", type=int, default=0, help="Start index in the data file for the prompt")
-    parser.add_argument("--sequence-length", type=int, default=4096, help="Length of the prompt (prefill)")
-    parser.add_argument("--generate-length", type=int, default=1024, help="Number of tokens to generate")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on")
-    parser.add_argument("--sampling-type", type=str, default="top_k", help="Sampling strategy (greedy, top_k)")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling parameter")
-    parser.add_argument("--pipeline-degree", type=int, default=3, help="Pipeline parallelism degree (number of stages/devices)")
-    
-    args = parser.parse_args()
+        if args.device:
+            device = torch.device(args.device)
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        log.warning("CUDA not available, switching to CPU.")
-        args.device = "cpu"
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
+        config_path = resolve_config_path(args.checkpoint_path, args.orig_ckpt_dir)
+        config_dict = load_config(config_path)
+
+        tokenizer = _load_tokenizer(args, config_dict)
         
-    # Handle Distributed / Pipeline Parallelism
-    if args.pipeline_degree > 1:
-        if not dist.is_available():
-             raise RuntimeError("Torch distributed is not available.")
-             
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-            
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        model_cfg = xLSTMLargeConfig.from_dict(config_dict["model"])
+        model_cfg.mode = "inference"
+        model_cfg.return_last_states = True
+
+        # Note: bfloat16 causes NaN issues with the mLSTM Triton kernels in inference mode.
+        # Use float32 for stable inference, or float16 if explicitly requested.
+        if args.fp16:
+            dtype = torch.float16
+            log.warning("Using float16 - may cause numerical instability with mLSTM kernels")
+        else:
+            dtype = torch.float32
+            log.info("Using float32 for stable inference")
         
-        # Set device based on local rank
-        args.device = f"cuda:{local_rank}"
-        torch.cuda.set_device(args.device)
-        
-        log.info(f"Initialized process group: rank {rank}/{world_size}, device {args.device}")
-        
-        model = load_model_pp(args.checkpoint_dir, args.device, args.pipeline_degree, rank, world_size)
-        tokenizer = load_tokenizer(args.checkpoint_dir)
-        
-        # Load data (only needed by Rank 0 efficiently, but loaded by all for simplicity or broadcast)
-        # For simplicity, everyone loads, but only Rank 0 uses it as IDs.
-        prefill_tokens = load_data(args.data_file, args.start_index, args.sequence_length)
-        prefill_tokens = prefill_tokens.unsqueeze(0).to(args.device)
-        
-        run_pp_inference(
-            model, 
-            prefill_tokens, 
-            args.generate_length, 
-            rank, 
-            world_size, 
-            args.device, 
-            args.sampling_type,
-            args.temperature,
-            args.top_k,
-            tokenizer
+        # Build model
+        model = model_cfg.build()
+        model = model.to(device=device, dtype=dtype)
+        model.eval()
+
+        # Load weights
+        _load_local_state_file(model, Path(args.checkpoint_path), strict=True)
+
+        sampling_fn = get_sampling_fn(args.sampling)
+
+        data = load_data(args.data_bin, args.data_dtype)
+        total_available = len(data) - args.offset
+        if total_available < args.prefill_len:
+            raise ValueError(
+                f"Requested prefill length {args.prefill_len} exceeds available tokens ({total_available})."
+            )
+
+        log.info(
+            "Starting inference: device=%s chunks=%s stride=%d prefill_len=%d max_new_tokens=%d",
+            device,
+            args.num_chunks or "until EOF",
+            args.stride or args.prefill_len,
+            args.prefill_len,
+            args.max_new_tokens,
         )
-        
-        dist.destroy_process_group()
-        return
 
-    # NOTE: This script does not support Pipeline Parallelism (PP) config reuse from training.
-    # To use PP, one would need to initialize the distributed environment (torch.distributed),
-    # create a device mesh, and shard the model accordingly using model.apply_pp().
-    # Currently, this script runs on a single device.
-        
-    model = load_model(args.checkpoint_dir, args.device)
-    tokenizer = load_tokenizer(args.checkpoint_dir)
-    
-    # Load data
-    prefill_tokens = load_data(args.data_file, args.start_index, args.sequence_length)
-    prefill_tokens = prefill_tokens.unsqueeze(0).to(args.device) # [B=1, S]
-    
-    run_single_device_inference(
-        model, 
-        prefill_tokens, 
-        args.generate_length, 
-        args.sampling_type, 
-        args.temperature, 
-        args.top_k, 
-        tokenizer, 
-        args.device
-    )
+        run_single_device_inference(
+            args=args,
+            model=model,
+            sampling_fn=sampling_fn,
+            data=data,
+            device=device,
+            tokenizer=tokenizer,
+        )
+
+    except Exception as e:
+        log.error(f"Error: {e}")
+        log.error(traceback.format_exc())
+        exit(1)
+
 
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)
     main()
-
