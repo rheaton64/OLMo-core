@@ -200,10 +200,10 @@ class xLSTMLarge(nn.Module):
             raise AssertionError(f"Input must have shape [B, S] or [B, S, D], got {x.shape}")
 
         x_out, state = self.backbone(x_emb, state)
-        assert state is not None
 
         if self.lm_head is None:
             if self.config.return_last_states:
+                assert state is not None, "State should not be None when return_last_states=True"
                 return x_out, state
             return x_out
 
@@ -233,6 +233,7 @@ class xLSTMLarge(nn.Module):
             )
 
         if self.config.return_last_states:
+            assert state is not None, "State should not be None when return_last_states=True"
             return logits_capped, state
         else:
             return logits_capped
@@ -423,21 +424,28 @@ class xLSTMLargeBlockStack(nn.Module):
 
     def forward(
         self, x: torch.Tensor, state: mLSTMStateType | None = None
-    ) -> tuple[torch.Tensor, mLSTMStateType]:
-        if state is None:
+    ) -> tuple[torch.Tensor, mLSTMStateType | None]:
+        # Only create state dict if we need to return states
+        if state is None and self.config.return_last_states:
             state = {i: None for i in range(len(self.blocks))}
 
         for i, block in enumerate(self.blocks):
-            block_state = state[i]
+            block_state = state[i] if state is not None else None
             x, block_state_new = block(x, block_state)
 
-            if block_state is None:
-                state[i] = block_state_new
+            if self.config.return_last_states:
+                # Accumulate state when return_last_states is enabled
+                assert state is not None
+                if block_state is None:
+                    state[i] = block_state_new
+                else:
+                    # layer state is a tuple of three tensors: c, n, m
+                    # we update the state in place in order to avoid creating new tensors
+                    for state_idx in range(len(block_state)):
+                        state[i][state_idx].copy_(block_state_new[state_idx])
             else:
-                # layer state is a tuple of three tensors: c, n, m
-                # we update the state in place in order to avoid creating new tensors
-                for state_idx in range(len(block_state)):
-                    state[i][state_idx].copy_(block_state_new[state_idx])
+                # Explicitly delete unused state to help garbage collection
+                del block_state_new
 
         x = self.out_norm(x)
 
@@ -697,7 +705,7 @@ class mLSTMBlock(nn.Module):
                     step_kernel=config.step_kernel,
                     mode=config.mode,
                     chunk_size=config.chunk_size,
-                    return_last_states=True,
+                    return_last_states=True,  # Always return states from backend (needed for unpacking)
                     autocast_kernel_dtype=config.autocast_kernel_dtype,
                     eps=config.eps,
                     inference_state_dtype=config.inference_state_dtype,

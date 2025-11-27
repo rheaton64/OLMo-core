@@ -94,7 +94,7 @@ def init_xlstm_gate_biases(model: nn.Module) -> None:
                     layer.ifgate_preact.bias[num_heads:].fill_(forget_bias)
 
 
-DATA_ROOT = "/raid/datasets/SYNTH"
+DATA_ROOT = "/home/ubuntu/datasets/SYNTH"
 DATA_PATHS = []
 for file in os.listdir(DATA_ROOT):
     if file.startswith("train"):
@@ -214,7 +214,7 @@ def build_config(opts, overrides: List[str]) -> ExperimentConfig:
         eos_token_id=2,
         pad_token_id=3,
         bos_token_id=1,
-        identifier="/raid/weights/xlstm",
+        identifier="~/OLMo-core/tokenizer",
     )
 
     # docs: start-model-config
@@ -242,6 +242,7 @@ def build_config(opts, overrides: List[str]) -> ExperimentConfig:
         global_batch_size=global_batch_size_tokens,  # NOTE: this is specified in tokens, not instances
         seed=0,
         num_workers=4,
+        ignore_fingerprint_mismatch=True,
     )
 
     pp_config = None
@@ -286,8 +287,8 @@ def build_config(opts, overrides: List[str]) -> ExperimentConfig:
         .with_callback(
             "checkpointer",
             CheckpointerCallback(
-                save_interval=1000,
-                ephemeral_save_interval=250,
+                save_interval=5000,
+                ephemeral_save_interval=1000,
                 save_async=True,
             ),
         )
@@ -296,8 +297,7 @@ def build_config(opts, overrides: List[str]) -> ExperimentConfig:
             WandBCallback(
                 project="SYNTH-xLSTM-large",
                 cancel_check_interval=10,
-                enabled=False,
-                name="fiery-silence-12"
+                enabled=True
             ),
         )
         .with_callback("config_saver", ConfigSaverCallback())
@@ -343,7 +343,7 @@ def parser_args():
     parser.add_argument(
         "--micro-batch-size",
         type=int,
-        default=1,
+        default=4,
         help="""The micro batch size in instances.""",
     )
     parser.add_argument(
@@ -366,7 +366,7 @@ def parser_args():
     parser.add_argument(
         "--pipeline-degree",
         type=int,
-        default=3,
+        default=1,
         help="""Number of pipeline stages to use. Set to 1 to disable pipeline parallelism.""",
     )
     parser.add_argument(

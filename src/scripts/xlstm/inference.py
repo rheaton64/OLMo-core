@@ -8,15 +8,16 @@ prefills the model with chunks from a ``data.bin`` file before streaming decoded
 Example::
 
     # Single-GPU inference
-    python src/scripts/xlstm/inference.py \
-        /raid/ckpts/SYNTH_xlstm_large/unshard/model.pt \
-        --orig-ckpt-dir /raid/ckpts/SYNTH_xlstm_large/step108000 \
-        --data-bin /raid/datasets/SYNTH/test_rank_00_0000.bin \
+    uv run src/scripts/xlstm/inference.py \
+        ~/ckpts/unshard/model.pt \
+        --data-bin ~/datasets/SYNTH/test_rank_00_0000.bin \
+        --tokenizer ~/OLMo-core/tokenizer \
         --prefill-len 4096 \
-        --max-new-tokens 64 \
+        --max-new-tokens 2048 \
         --num-chunks 1 \
         --keep-state \
         --stream \
+        --device cuda:0 \
         --verbose
 """
 
@@ -33,6 +34,7 @@ import numpy as np
 import torch
 
 from olmo_core.nn.xlstm_large.generate import get_sampling_fn
+from olmo_core.generate.sampling import select_next_token
 from olmo_core.nn.xlstm_large.model import xLSTMLarge, xLSTMLargeConfig
 from olmo_core.utils import prepare_cli_environment
 
@@ -95,7 +97,7 @@ def parse_args() -> argparse.Namespace:
         "--sampling",
         type=str,
         default="greedy",
-        choices=["greedy"],
+        choices=["greedy", "temperature"],
         help="Sampling strategy to use for decoding.",
     )
     parser.add_argument(
@@ -151,6 +153,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Top-k tokens to display when --debug-logits is set.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for sampling (default: 0.7).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=-1,
+        help="Top-k tokens to sample from (default: -1).",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Top-p tokens to sample from (default: 1.0).",
     )
     return parser.parse_args()
 
@@ -329,11 +349,14 @@ def stream_generate(
     model: xLSTMLarge,
     prefill_tokens: torch.Tensor,
     max_new_tokens: int,
-    sampling_fn: Callable[[torch.Tensor], torch.Tensor],
     state: Optional[Dict] = None,
     callback: Optional[Callable[[int, int], None]] = None,
     debug: bool = False,
     debug_top_k: int = 5,
+    do_sample: bool = True,
+    temperature: float = 1.0,
+    top_k: int = -1,
+    top_p: float = 1.0,
     tokenizer: Any = None,
 ) -> Tuple[torch.Tensor, Optional[Dict]]:
     logits, state = model(prefill_tokens, state)
@@ -347,7 +370,13 @@ def stream_generate(
         logits, state = model(last_token, state)
         if debug:
             _print_topk("decode_step0", logits, debug_top_k, tokenizer=tokenizer)
-        next_token = sampling_fn(logits[:, -1:])
+        next_token = select_next_token(
+            logits=logits.squeeze(1),
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        ).unsqueeze(-1)
         generated.append(next_token)
         if callback is not None:
             callback(step, int(next_token[0, 0].item()))
@@ -360,7 +389,9 @@ def run_single_device_inference(
     *,
     args: argparse.Namespace,
     model: xLSTMLarge,
-    sampling_fn: Callable[[torch.Tensor], torch.Tensor],
+    temperature: float,
+    top_k: int,
+    top_p: float,
     data: np.memmap,
     device: torch.device,
     tokenizer: Any,
@@ -393,7 +424,10 @@ def run_single_device_inference(
             model,
             prefill_tokens=prefill,
             max_new_tokens=args.max_new_tokens,
-            sampling_fn=sampling_fn,
+            do_sample=args.sampling == "temperature",
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
             state=state,
             callback=lambda step, token: print(f"{_decode_tokens(tokenizer, [token])}", end="", flush=True),
             debug=args.debug_logits,
@@ -447,8 +481,6 @@ def main():
         # Load weights
         _load_local_state_file(model, Path(args.checkpoint_path), strict=True)
 
-        sampling_fn = get_sampling_fn(args.sampling)
-
         data = load_data(args.data_bin, args.data_dtype)
         total_available = len(data) - args.offset
         if total_available < args.prefill_len:
@@ -468,7 +500,9 @@ def main():
         run_single_device_inference(
             args=args,
             model=model,
-            sampling_fn=sampling_fn,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
             data=data,
             device=device,
             tokenizer=tokenizer,

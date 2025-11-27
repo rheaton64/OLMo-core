@@ -3,6 +3,8 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 from ...aliases import PathOrStr
 from .callback import Callback
 
@@ -22,6 +24,15 @@ class GarbageCollectorCallback(Callback):
     """
 
     gc_interval: int = 1000
+    """Interval (in steps) for running generation 1 garbage collection."""
+    
+    full_gc_interval: int = 5000
+    """Interval (in steps) for running full garbage collection (all generations).
+    This helps clean up objects that have survived to generation 2."""
+    
+    empty_cuda_cache: bool = True
+    """Whether to empty CUDA cache during full GC to release GPU memory."""
+    
     enabled: bool = True
     _start_state: Optional[bool] = None
 
@@ -30,12 +41,24 @@ class GarbageCollectorCallback(Callback):
             return
         self._start_state = gc.isenabled()
         gc.disable()
-        log.info(f"Automatic GC disabled for training, will run GC every {self.gc_interval} steps")
+        log.info(
+            f"Automatic GC disabled for training, will run gen1 GC every {self.gc_interval} steps "
+            f"and full GC every {self.full_gc_interval} steps"
+        )
 
     def post_step(self):
         if not self.enabled:
             return
-        if self.step % self.gc_interval == 0:
+        
+        # Run full GC at full_gc_interval to clean up generation 2 objects
+        if self.step % self.full_gc_interval == 0:
+            if self.full_gc_interval > 10:
+                log.info("Running full garbage collection")
+            gc.collect()  # Full collection (all generations)
+            if self.empty_cuda_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        # Run gen1 GC at gc_interval
+        elif self.step % self.gc_interval == 0:
             if self.gc_interval > 10:
                 log.info("Running garbage collection")
             gc.collect(1)
@@ -50,4 +73,6 @@ class GarbageCollectorCallback(Callback):
         del path
         if not self.enabled:
             return
-        gc.collect(1)
+        gc.collect()  # Full collection after checkpoint
+        if self.empty_cuda_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
