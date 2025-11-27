@@ -12,10 +12,10 @@ Example::
         ~/ckpts/unshard/model.pt \
         --data-bin ~/datasets/SYNTH/test_rank_00_0000.bin \
         --tokenizer ~/OLMo-core/tokenizer \
-        --prefill-len 4096 \
-        --max-new-tokens 2048 \
+        --prefill-len 8192 \
+        --max-new-tokens 1024 \
         --num-chunks 1 \
-        --keep-state \
+        --offset 13999 \
         --stream \
         --device cuda:0 \
         --verbose
@@ -359,11 +359,17 @@ def stream_generate(
     top_p: float = 1.0,
     tokenizer: Any = None,
 ) -> Tuple[torch.Tensor, Optional[Dict]]:
+    device = prefill_tokens.device
+
     logits, state = model(prefill_tokens, state)
+    # Sync to ensure prefill completes before decode loop
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     if debug:
         _print_topk("prefill_last", logits[:, -1:], debug_top_k, tokenizer=tokenizer)
 
-    last_token = prefill_tokens[:, -1:]
+    # Use contiguous tensor to avoid potential issues with strided memory access
+    last_token = prefill_tokens[:, -1:].contiguous()
     generated: list[torch.Tensor] = []
 
     for step in range(max_new_tokens):
@@ -376,7 +382,7 @@ def stream_generate(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-        ).unsqueeze(-1)
+        ).unsqueeze(-1).contiguous()
         generated.append(next_token)
         if callback is not None:
             callback(step, int(next_token[0, 0].item()))
@@ -462,6 +468,9 @@ def main():
         
         model_cfg = xLSTMLargeConfig.from_dict(config_dict["model"])
         model_cfg.mode = "inference"
+        model_cfg.step_kernel = "native"
+        model_cfg.sequence_kernel = "native_sequence__native"
+        model_cfg.chunkwise_kernel = "chunkwise--native_autograd"
         model_cfg.return_last_states = True
 
         # Note: bfloat16 causes NaN issues with the mLSTM Triton kernels in inference mode.
